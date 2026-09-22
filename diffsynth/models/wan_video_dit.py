@@ -27,7 +27,10 @@ try:
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
 
-from block_sparse_attn import block_sparse_attn_func
+try:
+    from block_sparse_attn import block_sparse_attn_func
+except ModuleNotFoundError:
+    block_sparse_attn_func = None
 from PIL import Image
 import numpy as np
 
@@ -173,6 +176,11 @@ def generate_causal_block_mask(batch_size, nheads, seqlen, local_num, window_siz
 # ----------------------------
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False, attention_mask=None, return_KV=False):
     if attention_mask is not None:
+        if block_sparse_attn_func is None:
+            raise RuntimeError(
+                "Block-Sparse-Attention is not installed. Install the optional "
+                "extension or call this model with compatibility_mode=True."
+            )
         seqlen = q.shape[1]
         seqlen_kv = k.shape[1]
         q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
