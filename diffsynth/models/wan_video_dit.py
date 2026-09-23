@@ -178,8 +178,9 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
     if attention_mask is not None:
         if block_sparse_attn_func is None:
             raise RuntimeError(
-                "Block-Sparse-Attention is not installed. Install the optional "
-                "extension or call this model with compatibility_mode=True."
+                "Masked attention requires Block-Sparse-Attention. Install the optional "
+                "extension, or use compatibility_mode=True with no attention mask "
+                "for dense, unmasked attention."
             )
         seqlen = q.shape[1]
         seqlen_kv = k.shape[1]
@@ -299,9 +300,11 @@ class AttentionModule(nn.Module):
     def __init__(self, num_heads):
         super().__init__()
         self.num_heads = num_heads
+        self.compatibility_mode = False
         
     def forward(self, q, k, v, attention_mask=None):
-        x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, attention_mask=attention_mask)
+        x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads,
+                            compatibility_mode=self.compatibility_mode, attention_mask=attention_mask)
         return x
 
 
@@ -363,12 +366,18 @@ class SelfAttention(nn.Module):
 
         window_size = win[0]*h*w//128
 
-        if self.local_attn_mask is None or self.local_attn_mask_h!=h//8 or self.local_attn_mask_w!=w//8 or self.local_range!=local_range:
+        if not self.attn.compatibility_mode and (
+            self.local_attn_mask is None or self.local_attn_mask_h!=h//8
+            or self.local_attn_mask_w!=w//8 or self.local_range!=local_range
+        ):
             self.local_attn_mask = build_local_block_mask_shifted_vec_normal_slide(h//8, w//8, local_range, local_range, include_self=True, device=k_w.device)
             self.local_attn_mask_h = h//8
             self.local_attn_mask_w = w//8
             self.local_range = local_range
-        attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask)
+        # Compatibility mode uses dense, unmasked SDPA; it does not reproduce sparse attention.
+        attention_mask = None if self.attn.compatibility_mode else generate_draft_block_mask(
+            B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask
+        )
 
         x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
 

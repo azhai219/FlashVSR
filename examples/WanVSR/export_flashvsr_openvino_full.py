@@ -11,9 +11,10 @@ backend lowering of only DiT. It exports three groups of modules:
 
 Notes
 -----
-- The exported DiT models are NON-streaming forward variants (no per-layer
-  Python-side KV cache handoff), because the current streaming helper path uses
-  Python list state that is not directly representable as one static graph.
+- With --stateful, the first DiT exports the per-layer K/V prefill outputs;
+    the two-frame next DiT stores them in OpenVINO ReadValue/Assign variables.
+    Seed the next model's InferRequest states from the first model's outputs.
+- Without --stateful, the DiT variants have no inter-call KV state.
 - TCDecoder export uses parallel=True decode to avoid stateful sequential queue
   execution that is difficult to capture in a single static graph.
 - This script is for producing IR artifacts to benchmark feasibility and measure
@@ -28,6 +29,7 @@ from pathlib import Path
 
 import openvino as ov
 import torch
+from openvino.passes import Manager, MakeStateful
 
 ROOT_DIR = Path(__file__).resolve().parent
 FLASHVSR_ROOT = ROOT_DIR.parent.parent
@@ -61,6 +63,7 @@ class DitForwardWrapper(torch.nn.Module):
         t: torch.Tensor,
         cur_process_idx: int,
         layer_num: int = 1,
+        return_cache: bool = False,
     ):
         super().__init__()
         self.dit = dit
@@ -69,14 +72,18 @@ class DitForwardWrapper(torch.nn.Module):
         self.register_buffer("t", t, persistent=False)
         self.cur_process_idx = int(cur_process_idx)
         self.layer_num = layer_num
+        self.return_cache = return_cache
 
     def forward(self, x: torch.Tensor, timestep: torch.Tensor, lq_latents_stacked: torch.Tensor) -> torch.Tensor:
+        return self.run_chunk(x, timestep, lq_latents_stacked,
+                              [None] * len(self.dit.blocks), [None] * len(self.dit.blocks))
+
+    def run_chunk(self, x, timestep, lq_latents_stacked, pre_cache_k, pre_cache_v,
+                  freqs_override=None):
         # Unstack to list; model checks block_id < len(LQ_latents) so no None padding needed.
         lq_list = [lq_latents_stacked[i] for i in range(self.layer_num)]
-        
-        pre_cache_k = [None] * len(self.dit.blocks)
-        pre_cache_v = [None] * len(self.dit.blocks)
-        denoised, _, _ = model_fn_wan_video(
+
+        denoised, cache_k, cache_v = model_fn_wan_video(
             self.dit,
             x=x,
             timestep=timestep,
@@ -94,8 +101,33 @@ class DitForwardWrapper(torch.nn.Module):
             t_mod=self.t_mod,
             t=self.t,
             local_range=9,
+            freqs_override=freqs_override,
         )
+        if self.return_cache:
+            return (denoised, *cache_k, *cache_v)
         return denoised
+
+
+class DitNextStatefulWrapper(DitForwardWrapper):
+    def forward(self, x: torch.Tensor, timestep: torch.Tensor, lq_latents_stacked: torch.Tensor,
+                process_idx: torch.Tensor, *cache_tensors: torch.Tensor):
+        n = len(self.dit.blocks)
+        if len(cache_tensors) != 2 * n:
+            raise ValueError(f"Expected {2 * n} K/V caches, got {len(cache_tensors)}")
+        f = x.shape[2] // self.dit.patch_size[0]
+        h = x.shape[3] // self.dit.patch_size[1]
+        w = x.shape[4] // self.dit.patch_size[2]
+        frame_ids = torch.arange(f, device=x.device) + 4 + 2 * process_idx.reshape(())
+        # The OpenVINO frontend cannot index_select a complex tensor. Gather the
+        # real/imaginary pair first and reconstruct complex frequencies afterward.
+        freqs_ri = torch.cat([
+            torch.view_as_real(self.dit.freqs[0]).to(x.device).index_select(0, frame_ids).view(f, 1, 1, -1, 2).expand(f, h, w, -1, -1),
+            torch.view_as_real(self.dit.freqs[1][:h]).to(x.device).view(1, h, 1, -1, 2).expand(f, h, w, -1, -1),
+            torch.view_as_real(self.dit.freqs[2][:w]).to(x.device).view(1, 1, w, -1, 2).expand(f, h, w, -1, -1),
+        ], dim=-2).reshape(f * h * w, 1, -1, 2).contiguous()
+        freqs = torch.view_as_complex(freqs_ri)
+        return self.run_chunk(x, timestep, lq_latents_stacked,
+                              list(cache_tensors[:n]), list(cache_tensors[n:]), freqs_override=freqs)
 
 
 class TCDecoderWrapper(torch.nn.Module):
@@ -136,6 +168,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--decode-cond-frames", type=int, default=149, help="Conditioning frames for decoder export sample")
     p.add_argument("--device", default="CPU", help="OpenVINO target device string")
     p.add_argument(
+        "--compatibility-mode",
+        action="store_true",
+        help="Use dense, unmasked PyTorch SDPA instead of block-sparse attention (different outputs; high memory use)",
+    )
+    p.add_argument("--stateful", action="store_true", help="Export DiT KV caches as OpenVINO variables (ReadValue/Assign)")
+    p.add_argument(
         "--skip-existing",
         action="store_true",
         help="Skip exporting stages whose .xml and .bin already exist",
@@ -149,7 +187,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def build_pipeline(dtype: torch.dtype) -> FlashVSRTinyPipeline:
+def build_pipeline(dtype: torch.dtype, compatibility_mode: bool = False) -> FlashVSRTinyPipeline:
     mm = ModelManager(torch_dtype=dtype, device="cpu")
     mm.load_models(["./FlashVSR-v1.1/diffusion_pytorch_model_streaming_dmd.safetensors"])
     pipe = FlashVSRTinyPipeline.from_model_manager(mm, device="cpu")
@@ -169,6 +207,10 @@ def build_pipeline(dtype: torch.dtype) -> FlashVSRTinyPipeline:
 
     pipe.to("cpu")
     pipe.load_models_to_device(["dit", "vae"])
+    if compatibility_mode:
+        for block in pipe.dit.blocks:
+            block.self_attn.attn.compatibility_mode = True
+            block.cross_attn.attn.compatibility_mode = True
     pipe.init_cross_kv()
     pipe.eval()
     pipe.dit.eval()
@@ -177,8 +219,24 @@ def build_pipeline(dtype: torch.dtype) -> FlashVSRTinyPipeline:
     return pipe
 
 
-def export_model(module: torch.nn.Module, example_inputs, xml_path: Path) -> None:
+def export_model(module: torch.nn.Module, example_inputs, xml_path: Path, state_layers: int = 0) -> None:
     ov_model = ov.convert_model(module, example_input=example_inputs)
+    if state_layers:
+        parameters = ov_model.get_parameters()
+        results = ov_model.get_results()
+        if len(parameters) != 4 + 2 * state_layers or len(results) != 1 + 2 * state_layers:
+            raise RuntimeError(f"Unexpected DiT cache ports: {len(parameters)} inputs, {len(results)} outputs")
+        pairs = []
+        for i in range(2 * state_layers):
+            name = f"cache_{'k' if i < state_layers else 'v'}_{i % state_layers:02d}"
+            parameters[4 + i].get_output_tensor(0).set_names({name})
+            results[1 + i].get_output_tensor(0).set_names({name + '_out'})
+            pairs.append((parameters[4 + i], results[1 + i]))
+        manager = Manager()
+        manager.register_pass(MakeStateful(pairs))
+        manager.run_passes(ov_model)
+        if sum(op.get_type_name() == "ReadValue" for op in ov_model.get_ops()) != 2 * state_layers:
+            raise RuntimeError("Stateful conversion failed: missing ReadValue nodes")
     ov.save_model(ov_model, str(xml_path))
 
 
@@ -198,6 +256,8 @@ def main() -> None:
             "latent-frames-next must be 2 for FlashVSR streaming DiT export "
             "(subsequent chunk shape expected by model_fn path)."
         )
+    if args.stateful and not args.compatibility_mode:
+        raise ValueError("Stateful DiT export currently requires --compatibility-mode")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -217,7 +277,9 @@ def main() -> None:
         raise ValueError(f"Invalid output size {args.height}x{args.width}")
 
     print(f"[export] building pipeline (dtype={args.dtype}, free={free_gb:.2f} GiB)")
-    pipe = build_pipeline(dtype)
+    if args.compatibility_mode:
+        print("[export] compatibility mode: dense unmasked attention; outputs differ from block-sparse and memory use may be very high")
+    pipe = build_pipeline(dtype, compatibility_mode=args.compatibility_mode)
 
     # 1) LQ projector - export to process chunks of LQ frames
     lq_proj = LQProjWrapper(pipe.denoising_model().LQ_proj_in)
@@ -242,6 +304,7 @@ def main() -> None:
         t=pipe.t.detach().to(dtype),
         cur_process_idx=0,
         layer_num=1,  # Only first DiT layer uses LQ conditioning
+        return_cache=args.stateful,
     )
     x0 = torch.randn(1, 16, args.latent_frames_first, h8, w8, dtype=dtype)
     t0 = torch.tensor([1000.0], dtype=dtype)
@@ -276,24 +339,27 @@ def main() -> None:
         print(f"[export] dit_forward_first -> {dit0_xml}")
         export_model(dit0, (x0, t0, lq_latents_stacked_0), dit0_xml)
 
-    ditn = DitForwardWrapper(
+    ditn = (DitNextStatefulWrapper if args.stateful else DitForwardWrapper)(
         pipe.dit,
         context=context,
         t_mod=pipe.t_mod.detach().to(dtype),
         t=pipe.t.detach().to(dtype),
         cur_process_idx=1,
         layer_num=1,
+        return_cache=args.stateful,
     )
-    # Model enforces f==6 when pre_cache is None (stream start). Both chunks use 6 frames for tracing.
-    xn = torch.randn(1, 16, 6, h8, w8, dtype=dtype)
+    # Stateful next chunk has K/V from the first chunk and therefore uses two frames.
+    xn = torch.randn(1, 16, args.latent_frames_next if args.stateful else 6, h8, w8, dtype=dtype)
     tn = torch.tensor([1000.0], dtype=dtype)
-    # Regenerate LQ latents from fresh state for 6-frame next-chunk trace (same 7-call pattern as first).
-    print(f"[export] generating sample LQ latents for next chunk via stream_forward (7 calls, fresh state)...")
+    # Continue the projector cache for a two-frame next chunk in stateful mode.
+    next_calls = 2 if args.stateful else 7
+    print(f"[export] generating sample LQ latents for next chunk via stream_forward ({next_calls} calls)...")
     with torch.no_grad():
-        lq_proj_in.clear_cache()
+        if not args.stateful:
+            lq_proj_in.clear_cache()
         lq_chunks_n = []
-        sample_lq_video_n = torch.randn(1, 3, 7 * 4, args.height, args.width, dtype=dtype)
-        for inner_idx in range(7):
+        sample_lq_video_n = torch.randn(1, 3, next_calls * 4, args.height, args.width, dtype=dtype)
+        for inner_idx in range(next_calls):
             clip = sample_lq_video_n[:, :, inner_idx * 4:(inner_idx + 1) * 4, :, :]
             cur = lq_proj_in.stream_forward(clip)
             if cur is not None:
@@ -309,7 +375,16 @@ def main() -> None:
         print(f"[export] dit_forward_next exists, skipping: {ditn_xml}")
     else:
         print(f"[export] dit_forward_next -> {ditn_xml}")
-        export_model(ditn, (xn, tn, lq_latents_stacked_n), ditn_xml)
+        if args.stateful:
+            # At the end of the first call, the model retains three groups of 2-frame windows.
+            window_groups = (h8 // (2 * 8)) * (w8 // (2 * 8))
+            cache_shape = (3 * window_groups, 2 * 8 * 8, pipe.dit.dim)
+            sample_cache = torch.zeros(cache_shape, dtype=dtype)
+            cache_inputs = (sample_cache,) * (2 * len(pipe.dit.blocks))
+            export_model(ditn, (xn, tn, lq_latents_stacked_n, torch.tensor([1]), *cache_inputs),
+                         ditn_xml, state_layers=len(pipe.dit.blocks))
+        else:
+            export_model(ditn, (xn, tn, lq_latents_stacked_n), ditn_xml)
 
     # 3) TCDecoder decode path
     dec = TCDecoderWrapper(pipe.TCDecoder)
@@ -361,8 +436,13 @@ def main() -> None:
                 f"decode_latent_frames={args.decode_latent_frames}",
                 f"decode_cond_frames={cond.shape[2]}",
                 f"device={args.device}",
+                f"compatibility_mode={args.compatibility_mode}",
+                f"stateful={args.stateful}",
+                "NOTE: stateful first DiT returns (noise, K[0..N-1], V[0..N-1]); seed next IR states from these outputs",
+                "NOTE: map each next IR ReadValue output tensor name cache_k_00..cache_v_N to its variable_id, then call query_state().set_state()",
+                "NOTE: next DiT requires process_idx (1, 2, ...) and the SAME InferRequest for all chunks; reset state between videos",
                 "NOTE: lq_proj IR processes LQ frame chunks dynamically at inference time",
-                "NOTE: DiT IRs (first + next) accept (latents, timestep, lq_latents_chunk) for full SR conditioning",
+                "NOTE: first DiT accepts (latents, timestep, lq_latents_chunk); next DiT also accepts process_idx (1, 2, ...) and stores KV state internally",
             ]
         )
         + "\n",

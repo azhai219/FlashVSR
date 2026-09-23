@@ -15,6 +15,8 @@ RUN_OUTDIR          : output directory         (default ./results_run)
 RUN_TAG             : tag appended to output    (default <device>_<attn>)
 RUN_SCALE           : upscale factor            (default 2.0)
 RUN_SEED            : seed                       (default 0)
+RUN_OUT_W/H         : exact output resolution (multiples of 128)
+RUN_MAX_INPUT_FRAMES: optional cap for a short validation run (at least 29)
 FLASHVSR_ATTN_IMPL  : dense | flex | lcsa       (default dense)  -> read by the DiT
 OMP_NUM_THREADS     : (optional) CPU threads    -> also fed to torch.set_num_threads
 """
@@ -356,6 +358,12 @@ def prepare_input_tensor(path, scale, dtype, device):
     total = count_frames(rdr)
     if total <= 0:
         rdr.close(); raise RuntimeError(f"Cannot read frames from {path}")
+    frame_limit = int(os.environ.get("RUN_MAX_INPUT_FRAMES", "0"))
+    if frame_limit:
+        if frame_limit < 29:
+            rdr.close(); raise ValueError("RUN_MAX_INPUT_FRAMES must be at least 29 to exercise both stateful DiT chunks")
+        total = min(total, frame_limit)
+        print(f"[{os.path.basename(path)}] Using first {total} input frames for validation")
 
     print(f"[{os.path.basename(path)}] Resolution: {w0}x{h0} | Frames: {total} | FPS: {fps}")
     fill_mode = RUN_OUT_W > 0 and RUN_OUT_H > 0
@@ -484,6 +492,11 @@ def _quantize_and_swap_ffn(dit, ffn_fp32_list, calib_iters=2):
 # ----------------------------- pipeline (CPU/CUDA) -----------------------------
 def init_pipeline():
     t0 = time.time()
+    ir_dir = os.environ.get("RUN_STATEFUL_DIT_IR", "").strip()
+    if ir_dir and (RUN_DEVICE != "cpu" or RUN_DTYPE != "fp32"):
+        raise ValueError("RUN_STATEFUL_DIT_IR requires RUN_DEVICE=cpu and RUN_DTYPE=fp32")
+    if ir_dir and any(os.environ.get(key, "0") == "1" for key in ("RUN_OVCOMPILE", "RUN_INT8", "RUN_IPEX_INT8_FFN")):
+        raise ValueError("Saved stateful IR cannot be combined with OV torch.compile or DiT INT8")
     mm = ModelManager(torch_dtype=DTYPE, device="cpu")
     mm.load_models(["./FlashVSR-v1.1/diffusion_pytorch_model_streaming_dmd.safetensors"])
     pipe = FlashVSRTinyPipeline.from_model_manager(mm, device=DEVICE)
@@ -521,6 +534,10 @@ def init_pipeline():
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv()
     pipe.load_models_to_device(["dit", "vae"])
+    if ir_dir:
+        from stateful_dit import StatefulDiT
+        pipe.stateful_dit = StatefulDiT(ir_dir)
+        print(f"[init] using saved stateful DiT IR: {pipe.stateful_dit.ir_dir}")
 
     # Optional OpenVINO graph compilation via the torch.compile "openvino"
     # backend (openvino.torch). Captures the DiT fx graph and lowers it to an
@@ -640,7 +657,7 @@ def init_pipeline():
             print(f"[init] IPEX optimize skipped: {e}")
             traceback.print_exc()
 
-    backend_name = "openvino" if RUN_DEVICE == "cpu" and os.environ.get("RUN_OVCOMPILE", "0") == "1" else ("ipex" if RUN_DEVICE == "cpu" and os.environ.get("RUN_IPEX", "0") == "1" else "eager")
+    backend_name = "stateful-ir" if ir_dir else ("openvino" if RUN_DEVICE == "cpu" and os.environ.get("RUN_OVCOMPILE", "0") == "1" else ("ipex" if RUN_DEVICE == "cpu" and os.environ.get("RUN_IPEX", "0") == "1" else "eager"))
     print(f"[init] pipeline ready in {time.time() - t0:.1f}s (device={DEVICE}, dtype={RUN_DTYPE}, attn={ATTN_IMPL}, backend={backend_name}, local_th={LOCAL_TH}, local_tw={LOCAL_TW})")
     return pipe
 

@@ -163,6 +163,7 @@ class FlashVSRTinyPipeline(BasePipeline):
         self.use_unified_sequence_parallel = False
         self.prompt_emb_posi = None
         self.ColorCorrector = TorchColorCorrectorWavelet(levels=5)
+        self.stateful_dit = None
 
         print(r"""
 ███████╗██╗      █████╗ ███████╗██╗  ██╗██╗   ██╗███████╗█████╗
@@ -342,6 +343,8 @@ class FlashVSRTinyPipeline(BasePipeline):
         # 清理可能存在的 LQ_proj_in cache
         if hasattr(self.dit, "LQ_proj_in"):
             self.dit.LQ_proj_in.clear_cache()
+        if self.stateful_dit is not None:
+            self.stateful_dit.reset()
 
         latents_total = []
         self.TCDecoder.clean_mem()
@@ -386,7 +389,12 @@ class FlashVSRTinyPipeline(BasePipeline):
                     cur_latents = latents[:, :, 4+cur_process_idx*2:6+cur_process_idx*2, :, :]
 
                 # 推理（无 motion_controller / vace）
-                noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
+                if self.stateful_dit is not None:
+                    noise_pred_posi = self.stateful_dit(
+                        cur_latents, self.timestep, LQ_latents, cur_process_idx
+                    )
+                else:
+                    noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
                     self.dit,
                     x=cur_latents,
                     timestep=self.timestep,
@@ -404,7 +412,7 @@ class FlashVSRTinyPipeline(BasePipeline):
                     t_mod=self.t_mod,
                     t=self.t,
                     local_range = local_range,
-                )
+                    )
 
                 # 更新 latent
                 cur_latents = cur_latents - noise_pred_posi
@@ -504,6 +512,7 @@ def model_fn_wan_video(
     t_mod : torch.Tensor = None,
     t : torch.Tensor = None,
     local_range: int = 9,
+    freqs_override: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     # patchify
@@ -518,7 +527,9 @@ def model_fn_wan_video(
     kv_len = int(kv_ratio)
 
     # RoPE 位置（分段）
-    if cur_process_idx == 0:
+    if freqs_override is not None:
+        freqs = freqs_override
+    elif cur_process_idx == 0:
         freqs = torch.cat([
             dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
             dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
