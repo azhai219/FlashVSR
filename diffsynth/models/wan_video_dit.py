@@ -366,6 +366,7 @@ class SelfAttention(nn.Module):
 
         window_size = win[0]*h*w//128
 
+        ## highlight: attention_mask is generated here!
         if not self.attn.compatibility_mode and (
             self.local_attn_mask is None or self.local_attn_mask_h!=h//8
             or self.local_attn_mask_w!=w//8 or self.local_range!=local_range
@@ -379,6 +380,9 @@ class SelfAttention(nn.Module):
             B, self.num_heads, seqlen, q_w, k_w, topk=topk, local_attn_mask=self.local_attn_mask
         )
 
+        # highlight: attention_mask is passed to flash_attention
+        # and, flash_attention will use block_sparse_attn_func to compute attention with the mask
+        # otherwise, if compatibility_mode is True, it will use F.scaled_dot_product_attention without mask
         x = self.attn(reorder_q, reorder_k, reorder_v, attention_mask)
 
         cur_block_n, cur_block_s, _ = k_w.shape
